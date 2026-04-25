@@ -132,6 +132,38 @@ def get_usd_krw_rate() -> float:
     return 1350.0
 
 
+@st.cache_data(ttl=3600)
+def search_ticker_by_name(query: str) -> list:
+    """종목명(한글·영문) → 티커 검색 (Yahoo Finance Search API, 1시간 캐시)"""
+    try:
+        import requests
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        params = {
+            "q": query,
+            "lang": "ko-KR",
+            "region": "KR",
+            "quotesCount": 8,
+            "newsCount": 0,
+            "enableFuzzyQuery": False,
+            "quotesQueryId": "tss_match_phrase_query",
+        }
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp.raise_for_status()
+        return [
+            {
+                "symbol": q.get("symbol", ""),
+                "name": q.get("longname") or q.get("shortname") or q.get("symbol", ""),
+                "exchange": q.get("exchDisp", q.get("exchange", "")),
+                "type": q.get("typeDisp", "주식"),
+            }
+            for q in resp.json().get("quotes", [])
+            if q.get("symbol") and q.get("quoteType") in ("EQUITY", "ETF")
+        ]
+    except Exception:
+        return []
+
+
 # ── 자산제곱 5존 시스템 ──────────────────────────────────────
 
 def get_zone(gain_pct: float) -> tuple[str, str, str]:
@@ -410,6 +442,43 @@ def main():
             {"ticker": "GEV",       "shares":  5.0, "avg_price": 652.63, "currency": "USD"},
             {"ticker": "005930.KS", "shares": 10.0, "avg_price": 75000,  "currency": "KRW"},
         ]
+
+    with st.expander("🔍 종목명으로 검색해서 추가", expanded=False):
+        col_q, col_btn = st.columns([4, 1])
+        with col_q:
+            search_query = st.text_input(
+                "종목명", placeholder="예: 삼성전자, SK하이닉스, NVIDIA, Apple",
+                label_visibility="collapsed", key="search_query"
+            )
+        with col_btn:
+            st.write("")
+            search_clicked = st.button("검색", key="search_btn", use_container_width=True)
+
+        if search_clicked and search_query.strip():
+            with st.spinner("검색 중..."):
+                results = search_ticker_by_name(search_query.strip())
+            st.session_state["search_results"] = results
+            if not results:
+                st.warning("검색 결과가 없습니다. 다른 검색어를 입력해보세요.")
+
+        for idx, r in enumerate(st.session_state.get("search_results", [])[:6]):
+            col_info, col_add = st.columns([5, 1])
+            with col_info:
+                st.markdown(f"**{r['symbol']}** — {r['name']}  `{r['exchange']}` `{r['type']}`")
+            with col_add:
+                if st.button("추가", key=f"add_sr_{idx}", use_container_width=True):
+                    ticker = normalize_ticker(r["symbol"])
+                    if ticker not in [row["ticker"] for row in st.session_state.portfolio]:
+                        st.session_state.portfolio.append({
+                            "ticker": ticker,
+                            "shares": 1.0,
+                            "avg_price": 0.0,
+                            "currency": detect_currency(ticker),
+                        })
+                        st.session_state["search_results"] = []
+                        st.rerun()
+                    else:
+                        st.info(f"{ticker} 이미 추가됨")
 
     with st.expander("📸 보유종목 스크린샷으로 자동 추가", expanded=False):
         st.markdown('<div class="upload-box">', unsafe_allow_html=True)

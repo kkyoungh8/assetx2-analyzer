@@ -53,7 +53,7 @@ st.markdown("""
         border-radius: 12px;
         padding: 1.5rem;
         border: 1px solid #e0e0e0;
-        margin-hp: 1rem;
+        margin-top: 1rem;
         white-space: pre-wrap;
         font-family: 'Malgun Gothic', sans-serif;
         line-height: 1.8;
@@ -129,7 +129,7 @@ def fetch_stock_data(ticker: str) -> dict:
 
         current = float(hist_1d["Close"].iloc[-1])
         low_52w = float(hist_1y["Low"].min()) if not hist_1y.empty else 0
-        hygh_52w = float(hist_1y["High"].max()) if not hist_1y.empty else 0
+        high_52w = float(hist_1y["High"].max()) if not hist_1y.empty else 0
         volume = int(hist_1d["Volume"].iloc[-1]) if not hist_1d.empty else 0
         avg_volume = int(info.get("averageVolume", 0))
         name = info.get("shortName", ticker)
@@ -203,12 +203,18 @@ def main():
     with st.sidebar:
         st.header("⚙️ 설정")
 
-        api_key = st.text_input(
-            "Claude API 키",
-            type="password",
-            placeholder="sk-ant-...",
-            help="Anthropic Console에서 발급받은 API 키를 입력하세요.",
-        )
+        # secrets에 키가 있으면 자동 사용, 없으면 입력칸 표시
+        _secret_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
+        if _secret_key:
+            api_key = _secret_key
+            st.success("✅ API 키 설정 완료", icon="🔑")
+        else:
+            api_key = st.text_input(
+                "Claude API 키",
+                type="password",
+                placeholder="sk-ant-...",
+                help="Anthropic Console에서 발급받은 API 키를 입력하세요.",
+            )
 
         st.divider()
 
@@ -250,9 +256,9 @@ def main():
     # 세션 상태로 종목 관리
     if "portfolio" not in st.session_state:
         st.session_state.portfolio = [
-            {"ticker": "AVGO", "shares": 10.0, "avg_price": 337.77},
-            {"ticker": "GEV",  "shares": 5.0,  "avg_price": 656.67},
-            {"ticker": "VRT",  "shares": 8.0,  "avg_price": 196.56},
+            {"ticker": "AVGO", "shares": 10.0, "avg_price": 333.77},
+            {"ticker": "GEV",  "shares": 5.0,  "avg_price": 652.63},
+            {"ticker": "VRT",  "shares": 8.0,  "avg_price": 196.52},
         ]
 
     # 종목 추가/삭제 버튼

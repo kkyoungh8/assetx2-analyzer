@@ -132,20 +132,109 @@ def get_usd_krw_rate() -> float:
     return 1350.0
 
 
+def is_korean(text: str) -> bool:
+    """한글 포함 여부 확인"""
+    return bool(re.search(r'[가-힣]', text))
+
+
+@st.cache_data(ttl=3600)
+def search_naver_stock(query: str) -> list:
+    """네이버 금융 자동완성 - 한글 종목명 검색 (1시간 캐시)"""
+    try:
+        import requests
+        url = "https://ac.finance.naver.com/query.naver"
+        params = {"query": query, "target": "stock,etf"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Referer": "https://finance.naver.com",
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        text = resp.text.strip()
+
+        # 응답 형식: [["삼성전자","005930","stock,text"],...] 또는 JSONP 래핑
+        if text.startswith("[[") or text.startswith("[\""):
+            data = json.loads(text)
+        else:
+            m = re.search(r'\[\[.*?\]\]', text, re.DOTALL)
+            data = json.loads(m.group()) if m else []
+
+        results = []
+        for item in data:
+            if len(item) < 2:
+                continue
+            name = str(item[0])
+            code = str(item[1]).zfill(6)
+            results.append({
+                "symbol": f"{code}.KS",   # KRX 공통 (네이버는 코드만 사용)
+                "code": code,
+                "name": name,
+                "exchange": "KRX",
+                "type": "주식",
+            })
+        return results[:6]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)  # 1분 캐시 (실시간 시세)
+def fetch_naver_stock_data(code: str) -> dict:
+    """네이버 금융 모바일 API - 실시간 시세 + 52주 고저 + PER/PBR"""
+    try:
+        import requests
+        url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Referer": "https://m.stock.naver.com",
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        d = resp.json()
+
+        def to_float(val, default=0.0):
+            try:
+                return float(str(val).replace(",", "").replace("%", "").strip())
+            except Exception:
+                return default
+
+        current  = to_float(d.get("closePrice", 0))
+        high_52w = to_float(d.get("fiftyTwoWeekHighPrice", current * 1.3))
+        low_52w  = to_float(d.get("fiftyTwoWeekLowPrice",  current * 0.7))
+        volume   = int(to_float(d.get("accumulatedTradingVolume", 0)))
+
+        pos_52w = 0.0
+        if high_52w > low_52w:
+            pos_52w = round((current - low_52w) / (high_52w - low_52w) * 100, 1)
+
+        return {
+            "name":       d.get("stockName", code),
+            "current":    current,
+            "low_52w":    low_52w,
+            "high_52w":   high_52w,
+            "pos_52w":    pos_52w,
+            "volume":     volume,
+            "avg_volume": volume,
+            "vol_ratio":  1.0,
+            "currency":   "KRW",
+            "per":        to_float(d.get("per",  0)),
+            "pbr":        to_float(d.get("pbr",  0)),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @st.cache_data(ttl=3600)
 def search_ticker_by_name(query: str) -> list:
-    """종목명(한글·영문) → 티커 검색 (Yahoo Finance Search API, 1시간 캐시)"""
+    """종목명 → 티커 검색. 한글이면 네이버, 영문이면 Yahoo Finance 사용."""
+    if is_korean(query):
+        return search_naver_stock(query)
+    # 영문 → Yahoo Finance
     try:
         import requests
         url = "https://query2.finance.yahoo.com/v1/finance/search"
         params = {
-            "q": query,
-            "lang": "ko-KR",
-            "region": "KR",
-            "quotesCount": 8,
-            "newsCount": 0,
-            "enableFuzzyQuery": False,
-            "quotesQueryId": "tss_match_phrase_query",
+            "q": query, "lang": "en-US", "region": "US",
+            "quotesCount": 8, "newsCount": 0,
+            "enableFuzzyQuery": False, "quotesQueryId": "tss_match_phrase_query",
         }
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
         resp = requests.get(url, params=params, headers=headers, timeout=5)
@@ -153,9 +242,9 @@ def search_ticker_by_name(query: str) -> list:
         return [
             {
                 "symbol": q.get("symbol", ""),
-                "name": q.get("longname") or q.get("shortname") or q.get("symbol", ""),
+                "name":   q.get("longname") or q.get("shortname") or q.get("symbol", ""),
                 "exchange": q.get("exchDisp", q.get("exchange", "")),
-                "type": q.get("typeDisp", "주식"),
+                "type":   q.get("typeDisp", "Stock"),
             }
             for q in resp.json().get("quotes", [])
             if q.get("symbol") and q.get("quoteType") in ("EQUITY", "ETF")
@@ -208,12 +297,22 @@ def get_portfolio_zone(stock_pct: float) -> tuple[str, str]:
 
 @st.cache_data(ttl=300)  # 5분 캐시
 def fetch_stock_data(ticker: str) -> dict:
-    """yfinance로 실시간 주가 + 52주 데이터 조회 (한국/미국 모두 지원)"""
+    """실시간 주가 조회. 한국(.KS/.KQ) → 네이버, 미국 → yfinance"""
+    t = ticker.upper()
+
+    # ── 한국 주식: 네이버 금융 API ──────────────────────────
+    if t.endswith(".KS") or t.endswith(".KQ"):
+        code = t[:-3]
+        result = fetch_naver_stock_data(code)
+        if "error" not in result:
+            return result
+        # 네이버 실패 시 yfinance fallback (아래 계속)
+
+    # ── 미국 주식 (또는 네이버 실패 fallback): yfinance ────
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # 1d 데이터 먼저 시도, 없으면 5d
         hist_1d = stock.history(period="1d")
         if hist_1d.empty:
             hist_1d = stock.history(period="5d")
@@ -221,35 +320,29 @@ def fetch_stock_data(ticker: str) -> dict:
             return {"error": f"{ticker} 데이터를 찾을 수 없습니다. 티커를 확인해주세요."}
 
         hist_1y = stock.history(period="1y")
-
-        current = float(hist_1d["Close"].iloc[-1])
-        low_52w  = float(hist_1y["Low"].min())  if not hist_1y.empty else current * 0.7
-        high_52w = float(hist_1y["High"].max()) if not hist_1y.empty else current * 1.3
+        current   = float(hist_1d["Close"].iloc[-1])
+        low_52w   = float(hist_1y["Low"].min())  if not hist_1y.empty else current * 0.7
+        high_52w  = float(hist_1y["High"].max()) if not hist_1y.empty else current * 1.3
         volume    = int(hist_1d["Volume"].iloc[-1]) if not hist_1d.empty else 0
         avg_volume = int(info.get("averageVolume", 0))
-
-        # 종목명: 한국어 우선
-        name = (info.get("longName") or info.get("shortName") or ticker)
+        name      = info.get("longName") or info.get("shortName") or ticker
 
         pos_52w = 0.0
         if high_52w > low_52w:
             pos_52w = round((current - low_52w) / (high_52w - low_52w) * 100, 1)
 
-        vol_ratio = round(volume / avg_volume, 2) if avg_volume > 0 else 1.0
-
-        # 통화 (yfinance가 제공하는 경우 사용)
-        currency = info.get("currency", "USD")
-
         return {
-            "name": name,
-            "current": current,
-            "low_52w": low_52w,
-            "high_52w": high_52w,
-            "volume": volume,
+            "name":       name,
+            "current":    current,
+            "low_52w":    low_52w,
+            "high_52w":   high_52w,
+            "volume":     volume,
             "avg_volume": avg_volume,
-            "pos_52w": pos_52w,
-            "vol_ratio": vol_ratio,
-            "currency": currency,
+            "pos_52w":    pos_52w,
+            "vol_ratio":  round(volume / avg_volume, 2) if avg_volume > 0 else 1.0,
+            "currency":   info.get("currency", "USD"),
+            "per":        0.0,
+            "pbr":        0.0,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -619,6 +712,7 @@ def main():
                 "vol_ratio": data["vol_ratio"], "zone_label": zone_label,
                 "zone_css": zone_css, "zone_action": zone_action,
                 "sig_52w": sig_52w, "stop_price": avg_p * 0.92, "mkt_val_usd": mkt_val_usd,
+                "per": data.get("per", 0.0), "pbr": data.get("pbr", 0.0),
             }
             results.append(entry)
             if "손절" in zone_label or "경계" in zone_label or "익절" in zone_label:
@@ -648,13 +742,17 @@ def main():
                 df_rows.append({"종목": r["ticker"], "종목명": "-", "현재가": "조회실패",
                                  "수익률": "-", "평가금": "-", "손익": "-", "52주위치": "-", "상태": "❌"})
             else:
+                per_str = f"{r['per']:.1f}x" if r.get("per", 0) > 0 else "-"
+                pbr_str = f"{r['pbr']:.2f}x" if r.get("pbr", 0) > 0 else "-"
                 df_rows.append({
                     "종목": r["ticker"], "종목명": r["name"][:15],
                     "현재가": format_price(r["current"], curr),
                     "수익률": f"{r['gain_pct']:+.2f}%",
                     "평가금": format_value(r["mkt_val"], curr),
                     "손익": format_value(r["pnl"], curr),
-                    "52주위치": f"{r['pos_52w']:.0f}%", "상태": r["zone_label"],
+                    "52주위치": f"{r['pos_52w']:.0f}%",
+                    "PER": per_str, "PBR": pbr_str,
+                    "상태": r["zone_label"],
                 })
         st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
@@ -662,6 +760,9 @@ def main():
             st.subheader("🎯 즉시 액션 필요 종목")
             for r in alerts:
                 curr = r.get("currency", "USD")
+                per_pbr = ""
+                if r.get("per", 0) > 0:
+                    per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x"
                 st.markdown(f"""<div class="{r['zone_css']}">
                 <strong>{r['zone_label']} | {r['ticker']} — {r['name']}</strong><br>
                 현재가 <strong>{format_price(r['current'], curr)}</strong> |
@@ -669,7 +770,7 @@ def main():
                 수익률 <strong>{r['gain_pct']:+.2f}%</strong> |
                 평가금 {format_value(r['mkt_val'], curr)} (손익 {format_value(r['pnl'], curr)})<br>
                 손절가(-8%) <strong>{format_price(r['stop_price'], curr)}</strong> |
-                52주 {r['pos_52w']:.0f}% {r['sig_52w']}<br>
+                52주 {r['pos_52w']:.0f}% {r['sig_52w']}{per_pbr}<br>
                 💡 <em>{r['zone_action']}</em>
                 </div>""", unsafe_allow_html=True)
 
@@ -677,10 +778,11 @@ def main():
             with st.expander(f"✅ 정상 홀딩 종목 ({len(holds)}개)", expanded=False):
                 for r in holds:
                     curr = r.get("currency", "USD")
+                    per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x" if r.get("per", 0) > 0 else ""
                     st.markdown(f"""<div class="zone-hold">
                     <strong>{r['ticker']} — {r['name']}</strong> |
                     {format_price(r['current'], curr)} | {r['gain_pct']:+.2f}% |
-                    52주 {r['pos_52w']:.0f}% | {r['sig_52w']}
+                    52주 {r['pos_52w']:.0f}% | {r['sig_52w']}{per_pbr}
                     </div>""", unsafe_allow_html=True)
 
         st.markdown("---")

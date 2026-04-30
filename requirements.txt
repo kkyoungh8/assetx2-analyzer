@@ -2,3 +2,5 @@ streamlit>=1.32.0
 yfinance>=0.2.37
 anthropic>=0.25.0
 pandas>=2.0.0
+requests>=2.31.0
+pdfminer.six>=20221105

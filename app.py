@@ -155,16 +155,56 @@ def compress_strategy_context(ctx: str) -> str:
     return compressed[:2000] if len(compressed) > 2000 else compressed
 
 
-@st.cache_data(ttl=600)
-def get_usd_krw_rate() -> float:
-    """USD/KRW 환율 조회 (10분 캐시)"""
+@st.cache_data(ttl=60)  # 1분 캐시 (환율은 빠른 반영 필요)
+def get_exchange_rates() -> dict:
+    """환율 조회 - 네이버 금융 FX API (USD/KRW, JPY/KRW)
+    전일 대비 변동폭·방향까지 반환
+    """
+    def _fetch_naver_fx(code: str) -> dict:
+        import requests
+        url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Referer": "https://m.stock.naver.com",
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        d = resp.json()
+        def f(v, default=0.0):
+            try: return float(str(v).replace(",", "").replace("%", "").strip())
+            except: return default
+        rate   = f(d.get("closePrice", 0))
+        change = f(d.get("compareToPreviousClosePrice", 0))
+        chg_pct = f(d.get("fluctuationsRatio", 0))
+        return {"rate": rate, "change": change, "change_pct": chg_pct}
+
+    result = {
+        "usd": {"rate": 1350.0, "change": 0.0, "change_pct": 0.0},
+        "jpy": {"rate": 9.5,    "change": 0.0, "change_pct": 0.0},
+    }
     try:
-        hist = yf.Ticker("USDKRW=X").history(period="2d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+        result["usd"] = _fetch_naver_fx("FX_USDKRW")
+    except Exception:
+        # fallback: yfinance
+        try:
+            hist = yf.Ticker("USDKRW=X").history(period="2d")
+            if not hist.empty:
+                rate  = float(hist["Close"].iloc[-1])
+                prev  = float(hist["Close"].iloc[-2]) if len(hist) > 1 else rate
+                chg   = rate - prev
+                result["usd"] = {"rate": rate, "change": chg, "change_pct": chg/prev*100 if prev else 0}
+        except Exception:
+            pass
+    try:
+        result["jpy"] = _fetch_naver_fx("FX_JPYKRW")
     except Exception:
         pass
-    return 1350.0
+    return result
+
+
+def get_usd_krw_rate() -> float:
+    """USD/KRW 단순 환율값 (하위 호환용)"""
+    return get_exchange_rates()["usd"]["rate"]
 
 
 def is_korean(text: str) -> bool:
@@ -606,9 +646,32 @@ def main():
         """)
 
         st.divider()
-        st.caption("💱 USD/KRW 환율")
-        usd_krw = get_usd_krw_rate()
-        st.info(f"₩{usd_krw:,.0f} / $1")
+        st.caption("💱 환율 모니터링 (1분 캐시)")
+        fx = get_exchange_rates()
+        usd = fx["usd"]
+        jpy = fx["jpy"]
+        usd_krw = usd["rate"]
+
+        # USD/KRW
+        usd_arrow = "▲" if usd["change"] > 0 else ("▼" if usd["change"] < 0 else "—")
+        usd_color = "🔴" if usd["change"] > 0 else ("🔵" if usd["change"] < 0 else "⚪")
+        usd_sign  = "+" if usd["change"] > 0 else ""
+        st.markdown(
+            f"**USD/KRW** &nbsp; ₩{usd_krw:,.1f} &nbsp; "
+            f"{usd_color} {usd_arrow} {usd_sign}{usd['change']:,.1f} ({usd_sign}{usd['change_pct']:.2f}%)",
+            unsafe_allow_html=True,
+        )
+
+        # JPY/KRW (100엔 기준)
+        if jpy["rate"] > 0:
+            jpy_arrow = "▲" if jpy["change"] > 0 else ("▼" if jpy["change"] < 0 else "—")
+            jpy_color = "🔴" if jpy["change"] > 0 else ("🔵" if jpy["change"] < 0 else "⚪")
+            jpy_sign  = "+" if jpy["change"] > 0 else ""
+            st.markdown(
+                f"**JPY/KRW** &nbsp; ₩{jpy['rate']:,.2f} &nbsp; "
+                f"{jpy_color} {jpy_arrow} {jpy_sign}{jpy['change']:,.2f} ({jpy_sign}{jpy['change_pct']:.2f}%)",
+                unsafe_allow_html=True,
+            )
 
         st.divider()
         ctx = fetch_strategy_context()

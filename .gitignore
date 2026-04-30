@@ -1,0 +1,11 @@
+# Secrets
+strategy/.github_pat
+.github_pat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store

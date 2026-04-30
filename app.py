@@ -120,6 +120,20 @@ def get_tv_symbol(ticker: str) -> str:
         return f"KOSDAQ:{t[:-3]}"
     return t
 
+@st.cache_data(ttl=1800)  # 30분 캐시
+def fetch_strategy_context() -> str:
+    """GitHub에서 최신 전략 컨텍스트 로드"""
+    try:
+        import requests
+        url = "https://raw.githubusercontent.com/kkyoungh8/assetx2-analyzer/main/strategy/current_strategy.md"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            return resp.text
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(ttl=600)
 def get_usd_krw_rate() -> float:
     """USD/KRW 환율 조회 (10분 캐시)"""
@@ -414,11 +428,17 @@ def parse_portfolio_from_image(api_key: str, image_bytes: bytes, media_type: str
 # ── Claude AI 분석 ───────────────────────────────────────────
 
 def analyze_with_claude(api_key: str, portfolio_summary: str, cash_pct: float, zone_name: str) -> str:
-    """Claude API로 포트폴리오 종합 분석"""
+    """Claude API로 포트폴리오 종합 분석 (자산제곱 전략 컨텍스트 반영)"""
     client = anthropic.Anthropic(api_key=api_key)
 
-    prompt = f"""당신은 자산제곱 프레임워크를 사용하는 전문 포트폴리오 애널리스트입니다.
+    strategy_ctx = fetch_strategy_context()
+    strategy_section = f"""
+## 자산제곱 현재 전략 컨텍스트 (최신 리포트 기반)
+{strategy_ctx}
+""" if strategy_ctx else ""
 
+    prompt = f"""당신은 자산제곱 프레임워크를 사용하는 전문 포트폴리오 애널리스트입니다.
+{strategy_section}
 ## 현재 포트폴리오 현황
 {portfolio_summary}
 
@@ -428,12 +448,12 @@ def analyze_with_claude(api_key: str, portfolio_summary: str, cash_pct: float, z
 - 포트폴리오 존: {zone_name}
 
 ## 분석 요청
-위 포트폴리오를 자산제곱 5존 프레임워크로 분석해주세요.
+위 포트폴리오를 자산제곱 5존 프레임워크와 현재 전략 컨텍스트를 함께 반영해서 분석해주세요.
 
 다음 순서로 작성해주세요:
-1. **📊 전체 평가** (2~3문장, 포트폴리오 전반적인 상태)
-2. **🚨 즉시 액션 필요** (손절/익절 필요 종목 중심, 없으면 "없음")
-3. **💡 핵심 인사이트** (2~3가지, 가장 중요한 것)
+1. **📊 전체 평가** (현재 시장 국면 대비 이 포트폴리오의 포지션)
+2. **🚨 즉시 액션 필요** (손절/익절 필요 종목, 없으면 "없음")
+3. **💡 핵심 인사이트** (현재 전략 컨텍스트 기반 2~3가지)
 4. **📅 이번 주 할 일** (구체적인 액션 3가지 이내)
 
 톤: 친절하지만 솔직하게. 불필요한 칭찬 없이. 한국어로."""
@@ -525,6 +545,17 @@ def main():
         st.caption("💱 USD/KRW 환율")
         usd_krw = get_usd_krw_rate()
         st.info(f"₩{usd_krw:,.0f} / $1")
+
+        st.divider()
+        ctx = fetch_strategy_context()
+        if ctx:
+            # 업데이트 날짜 파싱
+            import re as _re
+            m = _re.search(r'최종 업데이트:\s*([\d-]+)', ctx)
+            updated = m.group(1) if m else "날짜 미상"
+            st.success(f"📋 전략 컨텍스트 로드됨\n\n업데이트: {updated}", icon="✅")
+        else:
+            st.warning("전략 컨텍스트 없음", icon="⚠️")
 
     st.subheader("📋 보유 종목 입력")
     st.caption("티커: 미국주식(AVGO, AAPL), 한국주식(005930.KS 또는 숫자 6자리 자동변환)")

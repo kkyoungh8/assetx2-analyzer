@@ -2,7 +2,7 @@
 자산제곱 AI 포트폴리오 분석기
 ================================
 자산제곱 5존 시스템 기반 포트폴리오 분석 웹앱
-yfinance 실시간 주가 + Claude AI 분석 + 이미지 파싱
+yfinance / 네이버 금융 실시간 주가 + Claude AI 분석 + 이미지 파싱
 
 사용법:
   pip install -r requirements.txt
@@ -134,6 +134,27 @@ def fetch_strategy_context() -> str:
     return ""
 
 
+def compress_strategy_context(ctx: str) -> str:
+    """전략 컨텍스트를 채팅용 압축 버전으로 변환 (~400토큰)
+    원본 전체 대신 핵심 섹션만 추출해 채팅 토큰 비용 절감
+    """
+    if not ctx:
+        return ""
+    lines = ctx.split('\n')
+    keep = []
+    include = False
+    # 상세 분석 텍스트 덤프 섹션은 제외, 전략/판단 섹션만 유지
+    skip_headers = {"## 📄 분석된 리포트", "## 📋 분석 내용"}
+    for line in lines:
+        if line.startswith('## '):
+            include = line.strip() not in skip_headers
+        if include or line.startswith('#'):
+            keep.append(line)
+    compressed = '\n'.join(keep).strip()
+    # 최대 2000자 (약 500토큰) 제한
+    return compressed[:2000] if len(compressed) > 2000 else compressed
+
+
 @st.cache_data(ttl=600)
 def get_usd_krw_rate() -> float:
     """USD/KRW 환율 조회 (10분 캐시)"""
@@ -165,7 +186,6 @@ def search_naver_stock(query: str) -> list:
         resp = requests.get(url, params=params, headers=headers, timeout=5)
         text = resp.text.strip()
 
-        # 응답 형식: [["삼성전자","005930","stock,text"],...] 또는 JSONP 래핑
         if text.startswith("[[") or text.startswith("[\""):
             data = json.loads(text)
         else:
@@ -179,7 +199,7 @@ def search_naver_stock(query: str) -> list:
             name = str(item[0])
             code = str(item[1]).zfill(6)
             results.append({
-                "symbol": f"{code}.KS",   # KRX 공통 (네이버는 코드만 사용)
+                "symbol": f"{code}.KS",
                 "code": code,
                 "name": name,
                 "exchange": "KRX",
@@ -241,7 +261,6 @@ def search_ticker_by_name(query: str) -> list:
     """종목명 → 티커 검색. 한글이면 네이버, 영문이면 Yahoo Finance 사용."""
     if is_korean(query):
         return search_naver_stock(query)
-    # 영문 → Yahoo Finance
     try:
         import requests
         url = "https://query2.finance.yahoo.com/v1/finance/search"
@@ -320,7 +339,6 @@ def fetch_stock_data(ticker: str) -> dict:
         result = fetch_naver_stock_data(code)
         if "error" not in result:
             return result
-        # 네이버 실패 시 yfinance fallback (아래 계속)
 
     # ── 미국 주식 (또는 네이버 실패 fallback): yfinance ────
     try:
@@ -365,7 +383,9 @@ def fetch_stock_data(ticker: str) -> dict:
 # ── 이미지 → 포트폴리오 파싱 ────────────────────────────────
 
 def parse_portfolio_from_image(api_key: str, image_bytes: bytes, media_type: str) -> list:
-    """Claude Vision으로 보유종목 스크린샷 → 포트폴리오 자동 파싱"""
+    """Claude Vision으로 보유종목 스크린샷 → 포트폴리오 자동 파싱
+    한국 증권사 컬럼명 매핑 강화 + 파싱 결과를 검수 테이블로 분리
+    """
     try:
         client = anthropic.Anthropic(api_key=api_key)
         image_b64 = base64.b64encode(image_bytes).decode()
@@ -386,20 +406,27 @@ def parse_portfolio_from_image(api_key: str, image_bytes: bytes, media_type: str
                     },
                     {
                         "type": "text",
-                        "text": """이 이미지는 주식 보유종목 화면입니다. 보유종목 정보를 추출해주세요.
+                        "text": """이 이미지는 한국 또는 미국 주식 증권사 앱의 보유종목 화면입니다.
 
-반드시 아래 JSON 배열 형식으로만 답변하세요 (다른 설명 없이):
+보유종목 정보를 추출해주세요. 반드시 JSON 배열로만 답변하세요 (다른 설명 없이):
 [
   {"ticker": "종목코드", "shares": 보유수량숫자, "avg_price": 평균단가숫자, "currency": "KRW 또는 USD"},
   ...
 ]
 
-규칙:
-- 한국 주식(숫자 종목코드): .KS 추가 (예: 005930 → 005930.KS)
-- 미국 주식: 그대로 (예: AAPL, AVGO)
-- 원화 단가 → "KRW", 달러 단가 → "USD"
-- 수량·단가가 불명확하면 해당 종목 제외
-- 숫자에 콤마 제거 (예: 1,000 → 1000)""",
+【한국 증권사 컬럼명 매핑 - 증권사마다 이름이 다름에 주의】
+수량 컬럼: 보유수량 / 수량 / 잔고수량 / 보유주수 / 잔량 / 보유 → shares
+단가 컬럼: 평균단가 / 평균매입가 / 매입단가 / 평균매수가 / 매수평균가 / 평균단가(원) → avg_price
+코드 컬럼: 종목코드 / 단축코드 / 코드 → ticker (6자리 숫자)
+
+【처리 규칙】
+- 한국 주식(6자리 숫자 코드): 숫자만 입력 (005930 등) — 앱이 자동으로 .KS 추가
+- 종목명만 있고 코드 없음: 종목명 그대로 ticker에 입력 (예: "삼성전자")
+- 한국 주식 단가 = 원화 → "KRW" / 미국 주식 단가 = 달러 → "USD"
+- 미국 주식: 영문 티커 그대로 (AAPL, NVDA, AVGO 등)
+- 숫자의 콤마·기호 제거 (1,234,567 → 1234567 / ▲▼ +- 제거)
+- 수량 또는 단가가 전혀 식별 불가한 종목은 제외
+- ETF도 동일하게 처리""",
                     },
                 ],
             }],
@@ -413,10 +440,10 @@ def parse_portfolio_from_image(api_key: str, image_bytes: bytes, media_type: str
             for item in parsed:
                 if "ticker" in item and "shares" in item and "avg_price" in item:
                     result.append({
-                        "ticker": str(item["ticker"]).strip().upper(),
+                        "ticker": str(item["ticker"]).strip(),
                         "shares": float(item["shares"]),
                         "avg_price": float(item["avg_price"]),
-                        "currency": item.get("currency", "USD"),
+                        "currency": item.get("currency", "KRW"),
                     })
             return result
         return []
@@ -471,6 +498,42 @@ def analyze_with_claude(api_key: str, portfolio_summary: str, cash_pct: float, z
         return f"❌ 분석 중 오류 발생: {str(e)}"
 
 
+def chat_with_claude(api_key: str, messages: list, compressed_ctx: str) -> str:
+    """전략 딥다이브 채팅 - Haiku 모델, 슬라이딩 윈도우 6턴
+    - claude-haiku: Sonnet 대비 약 20배 저렴
+    - 압축 컨텍스트: 전체 전략 문서 대신 핵심 ~400토큰만 사용
+    - 슬라이딩 윈도우: 최근 6개 메시지만 전달
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+
+    ctx_block = f"\n## 현재 전략 컨텍스트\n{compressed_ctx}" if compressed_ctx else ""
+
+    system = f"""당신은 자산제곱 프레임워크 기반 투자 전략 어시스턴트입니다.
+사용자의 투자 전략과 시장 판단에 대해 깊이 있는 대화를 제공합니다.
+{ctx_block}
+
+답변 원칙:
+- 한국어로 간결하게 (3~5문장 기본, 상세 요청 시 확장)
+- 자산제곱 5존 프레임워크 기반으로 판단
+- 투자 조언이 아닌 프레임워크 기반 분석 관점으로 답변"""
+
+    # 슬라이딩 윈도우: 최근 6개 메시지만 (3턴 대화)
+    windowed = messages[-6:] if len(messages) > 6 else messages
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            system=system,
+            messages=windowed,
+        )
+        return resp.content[0].text
+    except anthropic.AuthenticationError:
+        return "❌ API 키가 올바르지 않습니다."
+    except Exception as e:
+        return f"❌ 오류: {str(e)}"
+
+
 # ── TradingView 미니 차트 ────────────────────────────────────
 
 def show_tradingview_chart(ticker: str, height: int = 400):
@@ -508,6 +571,7 @@ def main():
     st.markdown('<p class="main-title">📊 자산제곱 AI 분석기</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-title">포트폴리오를 입력하고 AI 분석을 받아보세요</p>', unsafe_allow_html=True)
 
+    # ── 사이드바 ────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ 설정")
 
@@ -549,312 +613,433 @@ def main():
         st.divider()
         ctx = fetch_strategy_context()
         if ctx:
-            # 업데이트 날짜 파싱
-            import re as _re
-            m = _re.search(r'최종 업데이트:\s*([\d-]+)', ctx)
+            m = re.search(r'최종 업데이트:\s*([\d-]+)', ctx)
             updated = m.group(1) if m else "날짜 미상"
             st.success(f"📋 전략 컨텍스트 로드됨\n\n업데이트: {updated}", icon="✅")
         else:
             st.warning("전략 컨텍스트 없음", icon="⚠️")
 
-    st.subheader("📋 보유 종목 입력")
-    st.caption("티커: 미국주식(AVGO, AAPL), 한국주식(005930.KS 또는 숫자 6자리 자동변환)")
+    # ── 탭 구성 ─────────────────────────────────────────────
+    tab_analysis, tab_chat = st.tabs(["📊 포트폴리오 분석", "💬 전략 딥다이브"])
 
-    if "portfolio" not in st.session_state:
-        st.session_state.portfolio = [
-            {"ticker": "AVGO",      "shares": 10.0, "avg_price": 333.77, "currency": "USD"},
-            {"ticker": "GEV",       "shares":  5.0, "avg_price": 652.63, "currency": "USD"},
-            {"ticker": "005930.KS", "shares": 10.0, "avg_price": 75000,  "currency": "KRW"},
-        ]
+    # ════════════════════════════════════════════════════════
+    # 탭 1: 포트폴리오 분석
+    # ════════════════════════════════════════════════════════
+    with tab_analysis:
 
-    with st.expander("🔍 종목명으로 검색해서 추가", expanded=False):
-        col_q, col_btn = st.columns([4, 1])
-        with col_q:
-            search_query = st.text_input(
-                "종목명", placeholder="예: 삼성전자, SK하이닉스, NVIDIA, Apple",
-                label_visibility="collapsed", key="search_query"
-            )
-        with col_btn:
-            st.write("")
-            search_clicked = st.button("검색", key="search_btn", use_container_width=True)
+        st.subheader("📋 보유 종목 입력")
+        st.caption("티커: 미국주식(AVGO, AAPL), 한국주식(005930.KS 또는 숫자 6자리 자동변환)")
 
-        if search_clicked and search_query.strip():
-            with st.spinner("검색 중..."):
-                results = search_ticker_by_name(search_query.strip())
-            st.session_state["search_results"] = results
-            if not results:
-                st.warning("검색 결과가 없습니다. 다른 검색어를 입력해보세요.")
+        if "portfolio" not in st.session_state:
+            st.session_state.portfolio = [
+                {"ticker": "AVGO",      "shares": 10.0, "avg_price": 333.77, "currency": "USD"},
+                {"ticker": "GEV",       "shares":  5.0, "avg_price": 652.63, "currency": "USD"},
+                {"ticker": "005930.KS", "shares": 10.0, "avg_price": 75000,  "currency": "KRW"},
+            ]
 
-        for idx, r in enumerate(st.session_state.get("search_results", [])[:6]):
-            col_info, col_add = st.columns([5, 1])
-            with col_info:
-                st.markdown(f"**{r['symbol']}** — {r['name']}  `{r['exchange']}` `{r['type']}`")
-            with col_add:
-                if st.button("추가", key=f"add_sr_{idx}", use_container_width=True):
-                    ticker = normalize_ticker(r["symbol"])
-                    if ticker not in [row["ticker"] for row in st.session_state.portfolio]:
-                        st.session_state.portfolio.append({
-                            "ticker": ticker,
-                            "shares": 1.0,
-                            "avg_price": 0.0,
-                            "currency": detect_currency(ticker),
-                        })
-                        st.session_state["search_results"] = []
-                        st.rerun()
-                    else:
-                        st.info(f"{ticker} 이미 추가됨")
-
-    with st.expander("📸 보유종목 스크린샷으로 자동 추가", expanded=False):
-        st.markdown('<div class="upload-box">', unsafe_allow_html=True)
-        st.write("**증권사 앱 보유종목 화면을 캡처해서 업로드하면 자동으로 입력됩니다.**")
-        st.caption("지원 형식: PNG, JPG, JPEG • Claude Vision이 종목코드·수량·단가를 자동 인식")
-        uploaded_file = st.file_uploader("이미지 업로드", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
-        if uploaded_file is not None:
-            col_img, col_btn = st.columns([3, 1])
-            with col_img:
-                st.image(uploaded_file, caption="업로드된 이미지", use_container_width=True)
+        # ── 종목명 검색 ──────────────────────────────────────
+        with st.expander("🔍 종목명으로 검색해서 추가", expanded=False):
+            col_q, col_btn = st.columns([4, 1])
+            with col_q:
+                search_query = st.text_input(
+                    "종목명", placeholder="예: 삼성전자, SK하이닉스, NVIDIA, Apple",
+                    label_visibility="collapsed", key="search_query"
+                )
             with col_btn:
-                st.write(""); st.write("")
-                if st.button("🔍 자동 인식", type="primary"):
-                    if not api_key:
-                        st.error("API 키가 필요합니다.")
-                    else:
-                        with st.spinner("Claude가 종목을 인식하는 중..."):
-                            image_bytes = uploaded_file.getvalue()
-                            media_type = f"image/{uploaded_file.type.split('/')[-1]}"
-                            if media_type == "image/jpg":
-                                media_type = "image/jpeg"
-                            parsed = parse_portfolio_from_image(api_key, image_bytes, media_type)
-                        if parsed:
-                            added = 0
-                            for item in parsed:
-                                item["ticker"] = normalize_ticker(item["ticker"])
-                                existing = [r["ticker"] for r in st.session_state.portfolio]
-                                if item["ticker"] not in existing:
-                                    st.session_state.portfolio.append(item)
-                                    added += 1
-                            st.success(f"✅ {added}개 종목 추가됨")
+                st.write("")
+                search_clicked = st.button("검색", key="search_btn", use_container_width=True)
+
+            if search_clicked and search_query.strip():
+                with st.spinner("검색 중..."):
+                    results = search_ticker_by_name(search_query.strip())
+                st.session_state["search_results"] = results
+                if not results:
+                    st.warning("검색 결과가 없습니다. 다른 검색어를 입력해보세요.")
+
+            for idx, r in enumerate(st.session_state.get("search_results", [])[:6]):
+                col_info, col_add = st.columns([5, 1])
+                with col_info:
+                    st.markdown(f"**{r['symbol']}** — {r['name']}  `{r['exchange']}` `{r['type']}`")
+                with col_add:
+                    if st.button("추가", key=f"add_sr_{idx}", use_container_width=True):
+                        ticker = normalize_ticker(r["symbol"])
+                        if ticker not in [row["ticker"] for row in st.session_state.portfolio]:
+                            st.session_state.portfolio.append({
+                                "ticker": ticker,
+                                "shares": 1.0,
+                                "avg_price": 0.0,
+                                "currency": detect_currency(ticker),
+                            })
+                            st.session_state["search_results"] = []
                             st.rerun()
                         else:
-                            st.warning("종목을 인식하지 못했습니다.")
-        st.markdown('</div>', unsafe_allow_html=True)
+                            st.info(f"{ticker} 이미 추가됨")
 
-    st.write("")
-    col_add, col_clear, _ = st.columns([1, 1, 4])
-    with col_add:
-        if st.button("➕ 종목 추가"):
-            st.session_state.portfolio.append({"ticker": "", "shares": 1.0, "avg_price": 0.0, "currency": "USD"})
+        # ── 이미지 업로드 + 검수 UI ──────────────────────────
+        with st.expander("📸 보유종목 스크린샷으로 자동 추가", expanded=False):
+            st.markdown('<div class="upload-box">', unsafe_allow_html=True)
+            st.write("**증권사 앱 보유종목 화면을 캡처해서 업로드하면 자동으로 입력됩니다.**")
+            st.caption("지원 형식: PNG, JPG, JPEG • Claude Vision이 종목코드·수량·단가를 자동 인식 후 검수 단계 제공")
+            uploaded_file = st.file_uploader("이미지 업로드", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+
+            if uploaded_file is not None:
+                col_img, col_btn = st.columns([3, 1])
+                with col_img:
+                    st.image(uploaded_file, caption="업로드된 이미지", use_container_width=True)
+                with col_btn:
+                    st.write(""); st.write("")
+                    if st.button("🔍 자동 인식", type="primary"):
+                        if not api_key:
+                            st.error("API 키가 필요합니다.")
+                        else:
+                            with st.spinner("Claude가 종목을 인식하는 중..."):
+                                image_bytes = uploaded_file.getvalue()
+                                media_type = f"image/{uploaded_file.type.split('/')[-1]}"
+                                if media_type == "image/jpg":
+                                    media_type = "image/jpeg"
+                                parsed = parse_portfolio_from_image(api_key, image_bytes, media_type)
+                            if parsed:
+                                st.session_state["parsed_preview"] = parsed
+                            else:
+                                st.warning("종목을 인식하지 못했습니다. 이미지를 다시 확인해주세요.")
+
+            # ── 검수 테이블: 파싱 결과 확인·수정 후 추가 ──────
+            if st.session_state.get("parsed_preview"):
+                st.markdown("---")
+                st.markdown("#### 📝 인식 결과를 확인하고 수정해주세요")
+                st.caption("틀린 값은 직접 수정하거나 행을 삭제한 뒤 '추가' 버튼을 누르세요.")
+
+                preview_df = pd.DataFrame(st.session_state["parsed_preview"])
+                edited_df = st.data_editor(
+                    preview_df,
+                    column_config={
+                        "ticker": st.column_config.TextColumn("티커 / 종목코드", width="medium"),
+                        "shares": st.column_config.NumberColumn("수량", format="%.4f", min_value=0.0001),
+                        "avg_price": st.column_config.NumberColumn("평균단가", format="%.2f", min_value=0.01),
+                        "currency": st.column_config.SelectboxColumn("통화", options=["KRW", "USD"], width="small"),
+                    },
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="preview_editor",
+                )
+
+                col_confirm, col_cancel = st.columns([1, 1])
+                with col_confirm:
+                    if st.button("✅ 포트폴리오에 추가", type="primary", key="confirm_parse"):
+                        added = 0
+                        for _, row in edited_df.iterrows():
+                            ticker = normalize_ticker(str(row["ticker"]).strip())
+                            if not ticker:
+                                continue
+                            existing = [r["ticker"] for r in st.session_state.portfolio]
+                            if ticker not in existing:
+                                st.session_state.portfolio.append({
+                                    "ticker": ticker,
+                                    "shares": float(row["shares"]),
+                                    "avg_price": float(row["avg_price"]),
+                                    "currency": str(row["currency"]),
+                                })
+                                added += 1
+                        del st.session_state["parsed_preview"]
+                        st.success(f"✅ {added}개 종목이 추가되었습니다.")
+                        st.rerun()
+                with col_cancel:
+                    if st.button("❌ 취소", key="cancel_parse"):
+                        del st.session_state["parsed_preview"]
+                        st.rerun()
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 포트폴리오 테이블 ────────────────────────────────
+        st.write("")
+        col_add, col_clear, _ = st.columns([1, 1, 4])
+        with col_add:
+            if st.button("➕ 종목 추가"):
+                st.session_state.portfolio.append({"ticker": "", "shares": 1.0, "avg_price": 0.0, "currency": "USD"})
+                st.rerun()
+        with col_clear:
+            if st.button("🗑️ 전체 삭제"):
+                st.session_state.portfolio = []
+                st.rerun()
+
+        if st.session_state.portfolio:
+            hcols = st.columns([2, 1.5, 0.9, 2, 0.5])
+            hcols[0].markdown("**티커**"); hcols[1].markdown("**수량**")
+            hcols[2].markdown("**통화**"); hcols[3].markdown("**평균단가**"); hcols[4].markdown("**삭제**")
+
+        to_delete = []
+        for i, row in enumerate(st.session_state.portfolio):
+            cols = st.columns([2, 1.5, 0.9, 2, 0.5])
+            with cols[0]:
+                ticker_raw = st.text_input("티커", value=row["ticker"], key=f"ticker_{i}",
+                    label_visibility="collapsed", placeholder="AVGO 또는 005930")
+                ticker = normalize_ticker(ticker_raw)
+                st.session_state.portfolio[i]["ticker"] = ticker
+                if ticker != row["ticker"] and ticker:
+                    st.session_state.portfolio[i]["currency"] = detect_currency(ticker)
+            with cols[1]:
+                shares = st.number_input("수량", value=float(row["shares"]), min_value=0.0001,
+                    key=f"shares_{i}", format="%.4f", label_visibility="collapsed")
+                st.session_state.portfolio[i]["shares"] = shares
+            with cols[2]:
+                curr = row.get("currency", "USD")
+                currency = st.selectbox("통화", options=["USD", "KRW"],
+                    index=0 if curr == "USD" else 1, key=f"curr_{i}", label_visibility="collapsed")
+                st.session_state.portfolio[i]["currency"] = currency
+            with cols[3]:
+                if currency == "KRW":
+                    fmt, label, min_v, step_v = "%.0f", "평균단가 (₩)", 0.0, 100.0
+                else:
+                    fmt, label, min_v, step_v = "%.2f", "평균단가 ($)", 0.0, 0.01
+                avg_price = st.number_input(label, value=float(row["avg_price"]),
+                    min_value=min_v, step=step_v, key=f"avg_{i}", format=fmt, label_visibility="collapsed")
+                st.session_state.portfolio[i]["avg_price"] = avg_price
+            with cols[4]:
+                if st.button("✕", key=f"del_{i}"):
+                    to_delete.append(i)
+
+        for idx in sorted(to_delete, reverse=True):
+            st.session_state.portfolio.pop(idx)
+        if to_delete:
             st.rerun()
-    with col_clear:
-        if st.button("🗑️ 전체 삭제"):
-            st.session_state.portfolio = []
-            st.rerun()
 
-    if st.session_state.portfolio:
-        hcols = st.columns([2, 1.5, 0.9, 2, 0.5])
-        hcols[0].markdown("**티커**"); hcols[1].markdown("**수량**")
-        hcols[2].markdown("**통화**"); hcols[3].markdown("**평균단가**"); hcols[4].markdown("**삭제**")
+        st.divider()
 
-    to_delete = []
-    for i, row in enumerate(st.session_state.portfolio):
-        cols = st.columns([2, 1.5, 0.9, 2, 0.5])
-        with cols[0]:
-            ticker_raw = st.text_input("티커", value=row["ticker"], key=f"ticker_{i}",
-                label_visibility="collapsed", placeholder="AVGO 또는 005930")
-            ticker = normalize_ticker(ticker_raw)
-            st.session_state.portfolio[i]["ticker"] = ticker
-            if ticker != row["ticker"] and ticker:
-                st.session_state.portfolio[i]["currency"] = detect_currency(ticker)
-        with cols[1]:
-            shares = st.number_input("수량", value=float(row["shares"]), min_value=0.0001,
-                key=f"shares_{i}", format="%.4f", label_visibility="collapsed")
-            st.session_state.portfolio[i]["shares"] = shares
-        with cols[2]:
-            curr = row.get("currency", "USD")
-            currency = st.selectbox("통화", options=["USD", "KRW"],
-                index=0 if curr == "USD" else 1, key=f"curr_{i}", label_visibility="collapsed")
-            st.session_state.portfolio[i]["currency"] = currency
-        with cols[3]:
-            if currency == "KRW":
-                fmt, label, min_v, step_v = "%.0f", "평균단가 (₩)", 0.0, 100.0
-            else:
-                fmt, label, min_v, step_v = "%.2f", "평균단가 ($)", 0.0, 0.01
-            avg_price = st.number_input(label, value=float(row["avg_price"]),
-                min_value=min_v, step=step_v, key=f"avg_{i}", format=fmt, label_visibility="collapsed")
-            st.session_state.portfolio[i]["avg_price"] = avg_price
-        with cols[4]:
-            if st.button("✕", key=f"del_{i}"):
-                to_delete.append(i)
+        # ── 분석 실행 ────────────────────────────────────────
+        if st.button("🔍 지금 분석해줘!", type="primary"):
+            valid_rows = [r for r in st.session_state.portfolio
+                          if r["ticker"] and r["shares"] > 0 and r["avg_price"] > 0]
+            if not valid_rows:
+                st.error("분석할 종목을 먼저 입력해주세요.")
+                return
+            if not api_key:
+                st.error("사이드바에서 Claude API 키를 입력해주세요.")
+                return
 
-    for idx in sorted(to_delete, reverse=True):
-        st.session_state.portfolio.pop(idx)
-    if to_delete:
-        st.rerun()
+            usd_krw = get_usd_krw_rate()
+            progress = st.progress(0, text="실시간 주가 조회 중...")
+            results, alerts, holds = [], [], []
+            total_value_usd = total_cost_usd = 0.0
 
-    st.divider()
+            for i, row in enumerate(valid_rows):
+                ticker = row["ticker"]
+                input_currency = row.get("currency", "USD")
+                progress.progress((i+1)/len(valid_rows), text=f"주가 조회 중... {ticker}")
+                data = fetch_stock_data(ticker)
+                if not data or "error" in data:
+                    results.append({**row, "error": data.get("error", "조회 실패"), "current": None})
+                    continue
 
-    if st.button("🔍 지금 분석해줘!", type="primary"):
-        valid_rows = [r for r in st.session_state.portfolio
-                      if r["ticker"] and r["shares"] > 0 and r["avg_price"] > 0]
-        if not valid_rows:
-            st.error("분석할 종목을 먼저 입력해주세요.")
-            return
-        if not api_key:
-            st.error("사이드바에서 Claude API 키를 입력해주세요.")
-            return
+                current = data["current"]
+                market_currency = data.get("currency", input_currency)
+                avg_p, shares = row["avg_price"], row["shares"]
+                gain_pct = (current - avg_p) / avg_p * 100 if avg_p > 0 else 0
+                mkt_val, cost, pnl = current*shares, avg_p*shares, (current-avg_p)*shares
 
-        usd_krw = get_usd_krw_rate()
-        progress = st.progress(0, text="실시간 주가 조회 중...")
-        results, alerts, holds = [], [], []
-        total_value_usd = total_cost_usd = 0.0
+                if market_currency == "KRW":
+                    mkt_val_usd, cost_usd = mkt_val/usd_krw, cost/usd_krw
+                else:
+                    mkt_val_usd, cost_usd = mkt_val, cost
 
-        for i, row in enumerate(valid_rows):
-            ticker = row["ticker"]
-            input_currency = row.get("currency", "USD")
-            progress.progress((i+1)/len(valid_rows), text=f"주가 조회 중... {ticker}")
-            data = fetch_stock_data(ticker)
-            if not data or "error" in data:
-                results.append({**row, "error": data.get("error", "조회 실패"), "current": None})
-                continue
+                total_value_usd += mkt_val_usd
+                total_cost_usd  += cost_usd
 
-            current = data["current"]
-            market_currency = data.get("currency", input_currency)
-            avg_p, shares = row["avg_price"], row["shares"]
-            gain_pct = (current - avg_p) / avg_p * 100 if avg_p > 0 else 0
-            mkt_val, cost, pnl = current*shares, avg_p*shares, (current-avg_p)*shares
+                zone_label, zone_css, zone_action = get_zone(gain_pct)
+                sig_52w = get_52w_signal(data["pos_52w"])
 
-            if market_currency == "KRW":
-                mkt_val_usd, cost_usd = mkt_val/usd_krw, cost/usd_krw
-            else:
-                mkt_val_usd, cost_usd = mkt_val, cost
+                entry = {
+                    "ticker": ticker, "name": data.get("name", ticker),
+                    "shares": shares, "avg_price": avg_p, "current": current,
+                    "gain_pct": gain_pct, "mkt_val": mkt_val, "cost": cost, "pnl": pnl,
+                    "currency": market_currency, "pos_52w": data["pos_52w"],
+                    "low_52w": data["low_52w"], "high_52w": data["high_52w"],
+                    "vol_ratio": data["vol_ratio"], "zone_label": zone_label,
+                    "zone_css": zone_css, "zone_action": zone_action,
+                    "sig_52w": sig_52w, "stop_price": avg_p * 0.92, "mkt_val_usd": mkt_val_usd,
+                    "per": data.get("per", 0.0), "pbr": data.get("pbr", 0.0),
+                }
+                results.append(entry)
+                if "손절" in zone_label or "경계" in zone_label or "익절" in zone_label:
+                    alerts.append(entry)
+                else:
+                    holds.append(entry)
 
-            total_value_usd += mkt_val_usd
-            total_cost_usd  += cost_usd
+            progress.empty()
 
-            zone_label, zone_css, zone_action = get_zone(gain_pct)
-            sig_52w = get_52w_signal(data["pos_52w"])
+            total_gain_pct = (total_value_usd-total_cost_usd)/total_cost_usd*100 if total_cost_usd > 0 else 0
+            pnl_sign = "+" if total_value_usd >= total_cost_usd else ""
 
-            entry = {
-                "ticker": ticker, "name": data.get("name", ticker),
-                "shares": shares, "avg_price": avg_p, "current": current,
-                "gain_pct": gain_pct, "mkt_val": mkt_val, "cost": cost, "pnl": pnl,
-                "currency": market_currency, "pos_52w": data["pos_52w"],
-                "low_52w": data["low_52w"], "high_52w": data["high_52w"],
-                "vol_ratio": data["vol_ratio"], "zone_label": zone_label,
-                "zone_css": zone_css, "zone_action": zone_action,
-                "sig_52w": sig_52w, "stop_price": avg_p * 0.92, "mkt_val_usd": mkt_val_usd,
-                "per": data.get("per", 0.0), "pbr": data.get("pbr", 0.0),
-            }
-            results.append(entry)
-            if "손절" in zone_label or "경계" in zone_label or "익절" in zone_label:
-                alerts.append(entry)
-            else:
-                holds.append(entry)
+            st.markdown("---")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("총 평가금 (USD환산)", f"${total_value_usd:,.0f}")
+            m2.metric("총 원금 (USD환산)", f"${total_cost_usd:,.0f}")
+            m3.metric("총 손익", f"{pnl_sign}${total_value_usd-total_cost_usd:,.0f}",
+                      delta=f"{pnl_sign}{total_gain_pct:.2f}%")
+            m4.metric("포트폴리오 존", zone_name)
+            st.markdown("---")
 
-        progress.empty()
-
-        total_gain_pct = (total_value_usd-total_cost_usd)/total_cost_usd*100 if total_cost_usd > 0 else 0
-        pnl_sign = "+" if total_value_usd >= total_cost_usd else ""
-
-        st.markdown("---")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("총 평가금 (USD환산)", f"${total_value_usd:,.0f}")
-        m2.metric("총 원금 (USD환산)", f"${total_cost_usd:,.0f}")
-        m3.metric("총 손익", f"{pnl_sign}${total_value_usd-total_cost_usd:,.0f}",
-                  delta=f"{pnl_sign}{total_gain_pct:.2f}%")
-        m4.metric("포트폴리오 존", zone_name)
-        st.markdown("---")
-
-        st.subheader("📋 종목별 현황")
-        df_rows = []
-        for r in results:
-            curr = r.get("currency", "USD")
-            if r.get("current") is None:
-                df_rows.append({"종목": r["ticker"], "종목명": "-", "현재가": "조회실패",
-                                 "수익률": "-", "평가금": "-", "손익": "-", "52주위치": "-", "상태": "❌"})
-            else:
-                per_str = f"{r['per']:.1f}x" if r.get("per", 0) > 0 else "-"
-                pbr_str = f"{r['pbr']:.2f}x" if r.get("pbr", 0) > 0 else "-"
-                df_rows.append({
-                    "종목": r["ticker"], "종목명": r["name"][:15],
-                    "현재가": format_price(r["current"], curr),
-                    "수익률": f"{r['gain_pct']:+.2f}%",
-                    "평가금": format_value(r["mkt_val"], curr),
-                    "손익": format_value(r["pnl"], curr),
-                    "52주위치": f"{r['pos_52w']:.0f}%",
-                    "PER": per_str, "PBR": pbr_str,
-                    "상태": r["zone_label"],
-                })
-        st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
-
-        if alerts:
-            st.subheader("🎯 즉시 액션 필요 종목")
-            for r in alerts:
+            st.subheader("📋 종목별 현황")
+            df_rows = []
+            for r in results:
                 curr = r.get("currency", "USD")
-                per_pbr = ""
-                if r.get("per", 0) > 0:
-                    per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x"
-                st.markdown(f"""<div class="{r['zone_css']}">
-                <strong>{r['zone_label']} | {r['ticker']} — {r['name']}</strong><br>
-                현재가 <strong>{format_price(r['current'], curr)}</strong> |
-                평균단가 {format_price(r['avg_price'], curr)} |
-                수익률 <strong>{r['gain_pct']:+.2f}%</strong> |
-                평가금 {format_value(r['mkt_val'], curr)} (손익 {format_value(r['pnl'], curr)})<br>
-                손절가(-8%) <strong>{format_price(r['stop_price'], curr)}</strong> |
-                52주 {r['pos_52w']:.0f}% {r['sig_52w']}{per_pbr}<br>
-                💡 <em>{r['zone_action']}</em>
-                </div>""", unsafe_allow_html=True)
+                if r.get("current") is None:
+                    df_rows.append({"종목": r["ticker"], "종목명": "-", "현재가": "조회실패",
+                                     "수익률": "-", "평가금": "-", "손익": "-", "52주위치": "-", "상태": "❌"})
+                else:
+                    per_str = f"{r['per']:.1f}x" if r.get("per", 0) > 0 else "-"
+                    pbr_str = f"{r['pbr']:.2f}x" if r.get("pbr", 0) > 0 else "-"
+                    df_rows.append({
+                        "종목": r["ticker"], "종목명": r["name"][:15],
+                        "현재가": format_price(r["current"], curr),
+                        "수익률": f"{r['gain_pct']:+.2f}%",
+                        "평가금": format_value(r["mkt_val"], curr),
+                        "손익": format_value(r["pnl"], curr),
+                        "52주위치": f"{r['pos_52w']:.0f}%",
+                        "PER": per_str, "PBR": pbr_str,
+                        "상태": r["zone_label"],
+                    })
+            st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
-        if holds:
-            with st.expander(f"✅ 정상 홀딩 종목 ({len(holds)}개)", expanded=False):
-                for r in holds:
+            if alerts:
+                st.subheader("🎯 즉시 액션 필요 종목")
+                for r in alerts:
                     curr = r.get("currency", "USD")
-                    per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x" if r.get("per", 0) > 0 else ""
-                    st.markdown(f"""<div class="zone-hold">
-                    <strong>{r['ticker']} — {r['name']}</strong> |
-                    {format_price(r['current'], curr)} | {r['gain_pct']:+.2f}% |
-                    52주 {r['pos_52w']:.0f}% | {r['sig_52w']}{per_pbr}
+                    per_pbr = ""
+                    if r.get("per", 0) > 0:
+                        per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x"
+                    st.markdown(f"""<div class="{r['zone_css']}">
+                    <strong>{r['zone_label']} | {r['ticker']} — {r['name']}</strong><br>
+                    현재가 <strong>{format_price(r['current'], curr)}</strong> |
+                    평균단가 {format_price(r['avg_price'], curr)} |
+                    수익률 <strong>{r['gain_pct']:+.2f}%</strong> |
+                    평가금 {format_value(r['mkt_val'], curr)} (손익 {format_value(r['pnl'], curr)})<br>
+                    손절가(-8%) <strong>{format_price(r['stop_price'], curr)}</strong> |
+                    52주 {r['pos_52w']:.0f}% {r['sig_52w']}{per_pbr}<br>
+                    💡 <em>{r['zone_action']}</em>
                     </div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader("📈 TradingView 차트")
-        valid_results = [r for r in results if r.get("current") is not None]
-        if valid_results:
-            chart_ticker = st.selectbox("차트 볼 종목 선택",
-                options=[r["ticker"] for r in valid_results],
-                format_func=lambda t: next(
-                    (f"{r['ticker']} — {r['name']}" for r in valid_results if r["ticker"] == t), t))
-            if chart_ticker:
-                show_tradingview_chart(chart_ticker, height=450)
+            if holds:
+                with st.expander(f"✅ 정상 홀딩 종목 ({len(holds)}개)", expanded=False):
+                    for r in holds:
+                        curr = r.get("currency", "USD")
+                        per_pbr = f" | PER {r['per']:.1f}x · PBR {r['pbr']:.2f}x" if r.get("per", 0) > 0 else ""
+                        st.markdown(f"""<div class="zone-hold">
+                        <strong>{r['ticker']} — {r['name']}</strong> |
+                        {format_price(r['current'], curr)} | {r['gain_pct']:+.2f}% |
+                        52주 {r['pos_52w']:.0f}% | {r['sig_52w']}{per_pbr}
+                        </div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader("🤖 AI 종합 분석")
-        with st.spinner("Claude AI가 포트폴리오를 분석하고 있습니다..."):
-            summary_lines = []
-            for r in results:
-                if r.get("current"):
-                    curr = r.get("currency", "USD")
-                    summary_lines.append(
-                        f"- {r['ticker']} ({r['name']}, {curr}): "
-                        f"현재 {format_price(r['current'], curr)}, "
-                        f"평균단가 {format_price(r['avg_price'], curr)}, "
-                        f"수익률 {r['gain_pct']:+.2f}%, "
-                        f"평가금 {format_value(r['mkt_val'], curr)}, "
-                        f"상태: {r['zone_label']}"
-                    )
-            portfolio_summary = "\n".join(summary_lines)
-            portfolio_summary += f"\n\n총 평가금(USD환산): ${total_value_usd:,.0f} | 총 손익: {total_gain_pct:+.2f}% | USD/KRW: {usd_krw:,.0f}"
-            ai_report = analyze_with_claude(api_key, portfolio_summary, cash_pct, zone_name)
+            st.markdown("---")
+            st.subheader("📈 TradingView 차트")
+            valid_results = [r for r in results if r.get("current") is not None]
+            if valid_results:
+                chart_ticker = st.selectbox("차트 볼 종목 선택",
+                    options=[r["ticker"] for r in valid_results],
+                    format_func=lambda t: next(
+                        (f"{r['ticker']} — {r['name']}" for r in valid_results if r["ticker"] == t), t))
+                if chart_ticker:
+                    show_tradingview_chart(chart_ticker, height=450)
 
-        st.markdown(f'<div class="report-box">{ai_report}</div>', unsafe_allow_html=True)
-        st.caption(f"분석 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 주가: yfinance (5분 캐시)")
+            st.markdown("---")
+            st.subheader("🤖 AI 종합 분석")
+            with st.spinner("Claude AI가 포트폴리오를 분석하고 있습니다..."):
+                summary_lines = []
+                for r in results:
+                    if r.get("current"):
+                        curr = r.get("currency", "USD")
+                        summary_lines.append(
+                            f"- {r['ticker']} ({r['name']}, {curr}): "
+                            f"현재 {format_price(r['current'], curr)}, "
+                            f"평균단가 {format_price(r['avg_price'], curr)}, "
+                            f"수익률 {r['gain_pct']:+.2f}%, "
+                            f"평가금 {format_value(r['mkt_val'], curr)}, "
+                            f"상태: {r['zone_label']}"
+                        )
+                portfolio_summary = "\n".join(summary_lines)
+                portfolio_summary += f"\n\n총 평가금(USD환산): ${total_value_usd:,.0f} | 총 손익: {total_gain_pct:+.2f}% | USD/KRW: {usd_krw:,.0f}"
+                ai_report = analyze_with_claude(api_key, portfolio_summary, cash_pct, zone_name)
 
-        with st.expander("⚠️ 면책 조항"):
-            st.markdown("""
-            본 서비스는 개인적인 포트폴리오 현황 파악을 위한 참고 도구입니다.
-            투자 조언이나 매수/매도 권유를 목적으로 하지 않습니다.
-            모든 투자 결정과 그 결과에 대한 책임은 투자자 본인에게 있습니다.
-            """)
+            st.markdown(f'<div class="report-box">{ai_report}</div>', unsafe_allow_html=True)
+            st.caption(f"분석 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 주가: yfinance/네이버금융 (5분 캐시)")
+
+            with st.expander("⚠️ 면책 조항"):
+                st.markdown("""
+                본 서비스는 개인적인 포트폴리오 현황 파악을 위한 참고 도구입니다.
+                투자 조언이나 매수/매도 권유를 목적으로 하지 않습니다.
+                모든 투자 결정과 그 결과에 대한 책임은 투자자 본인에게 있습니다.
+                """)
+
+    # ════════════════════════════════════════════════════════
+    # 탭 2: 전략 딥다이브 채팅
+    # ════════════════════════════════════════════════════════
+    with tab_chat:
+        st.subheader("💬 전략 딥다이브")
+        st.caption("현재 자산제곱 전략 컨텍스트 기반으로 자유롭게 질문하세요.")
+
+        if not api_key:
+            st.warning("💡 사이드바에서 Claude API 키를 먼저 입력해주세요.")
+        else:
+            # 채팅 히스토리 초기화
+            if "chat_messages" not in st.session_state:
+                st.session_state.chat_messages = []
+
+            # 전략 컨텍스트 상태 표시
+            if ctx:
+                m = re.search(r'최종 업데이트:\s*([\d-]+)', ctx)
+                updated = m.group(1) if m else "날짜 미상"
+                st.info(f"📋 전략 컨텍스트 기반 ({updated}) | Haiku 모델 | 최근 3턴 컨텍스트 유지")
+            else:
+                st.warning("⚠️ 전략 컨텍스트 없음 — 일반 자산제곱 프레임워크 기반으로 답변합니다.")
+
+            # 추천 질문
+            if not st.session_state.chat_messages:
+                st.markdown("**💡 이런 질문을 해보세요:**")
+                sample_qs = [
+                    "5월 변동성 구간에서 현금 비중을 어떻게 조절해야 할까요?",
+                    "반도체 직접 투자 vs AI 소프트웨어 인프라, 지금은 어느 쪽이 나을까요?",
+                    "비트코인 클래리티 법안이 통과되면 포트폴리오에 어떤 영향이 있을까요?",
+                    "케빈 워시가 연준 의장이 되면 금리 정책이 어떻게 바뀔 수 있나요?",
+                ]
+                cols = st.columns(2)
+                for i, q in enumerate(sample_qs):
+                    with cols[i % 2]:
+                        if st.button(q, key=f"sample_q_{i}", use_container_width=True):
+                            st.session_state.chat_messages.append({"role": "user", "content": q})
+                            compressed = compress_strategy_context(ctx)
+                            response = chat_with_claude(api_key, st.session_state.chat_messages, compressed)
+                            st.session_state.chat_messages.append({"role": "assistant", "content": response})
+                            st.rerun()
+
+            # 대화 히스토리 렌더링
+            for msg in st.session_state.chat_messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # 입력창
+            if prompt := st.chat_input("전략에 대해 궁금한 점을 물어보세요..."):
+                st.session_state.chat_messages.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                with st.chat_message("assistant"):
+                    with st.spinner(""):
+                        compressed = compress_strategy_context(ctx)
+                        response = chat_with_claude(api_key, st.session_state.chat_messages, compressed)
+                    st.markdown(response)
+
+                st.session_state.chat_messages.append({"role": "assistant", "content": response})
+                st.rerun()
+
+            # 대화 초기화 + 상태 표시
+            if st.session_state.chat_messages:
+                col_clear, col_info = st.columns([1, 3])
+                with col_clear:
+                    if st.button("🗑️ 대화 초기화", key="clear_chat"):
+                        st.session_state.chat_messages = []
+                        st.rerun()
+                with col_info:
+                    n_turns = len(st.session_state.chat_messages) // 2
+                    st.caption(f"💬 {n_turns}턴 대화 중 | 최근 3턴만 전송 (토큰 절약)")
 
 
 if __name__ == "__main__":

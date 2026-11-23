@@ -12,7 +12,15 @@
 """
 import csv, io, json, sys, time, datetime as dt
 from pathlib import Path
-import requests
+import urllib.request
+
+
+class _Resp:
+    def __init__(self, code, body):
+        self.status_code, self.text = code, body
+
+    def json(self):
+        return json.loads(self.text)
 
 HERE = Path(__file__).parent
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -23,10 +31,11 @@ G, Y, R, U = "🟢", "🟡", "🔴", "⚪"
 def _get(url, tries=3, headers=UA):
     for i in range(tries):
         try:
-            r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code == 200:
-                return r
-        except requests.RequestException:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status == 200:
+                    return _Resp(200, r.read().decode("utf-8", "replace"))
+        except Exception:  # 표준 라이브러리만 사용(새 세션에 requests 설치 불필요)
             pass
         time.sleep(2 * (i + 1))
     return None

@@ -11,6 +11,15 @@
 
 from dataclasses import dataclass, field
 
+COACH_SYSTEM = """당신은 한 사람만을 위한 개인 부의 코치입니다. 사용자가 주는 프롬프트의 역할·단계·규칙·출력 형식을 그대로 따릅니다.
+
+진행 원칙:
+- 한국어로 답합니다.
+- 정보가 부족해 정직한 결론을 내리기 어려우면, 결론 대신 꼭 필요한 질문만 짧게 묻습니다(한 번에 최대 3개). 사용자가 답하면 이어서 진행합니다.
+- 결론을 낼 때는 프롬프트의 '출력 형식' 항목 이름을 그대로 굵은 글씨 머리말로 써서, 항목마다 채웁니다.
+- 사용자가 말하지 않은 사실을 지어내지 않습니다. 추정이 필요하면 '추정'이라고 밝힙니다.
+- 투자 자산에 대해서는 특정 종목 매수·매도를 권하지 않고, 목표와의 관계만 다룹니다."""
+
 
 @dataclass
 class Step:
@@ -227,3 +236,35 @@ def build_prompt(step: Step, ctx_values: list, prev_result: str, use_boost: bool
 
 def fields_for(step: Step, use_boost: bool) -> list:
     return step.output_fields + (step.boost_fields if use_boost else [])
+
+
+def weekly_prompt(goal: dict, plan_result: str, habit_days: int, done: str, blocked: str, nxt: str) -> str:
+    """주간 점검 프롬프트 (원문 4개에는 없는, 이 앱에서 새로 만든 프롬프트)"""
+    return f"""# 역할:
+당신은 나폴레온 힐의 관점으로 훈련받은 부의 코치입니다. 대부분의 사람은 첫 계획이 실패했을 때 새 계획을 세우지 못하고 포기합니다. 계획이 막혔을 때 필요한 것은 포기가 아니라 고친 계획입니다.
+
+# 과제:
+이번 주 기록을 보고, 계획을 계속 붙들도록 짧게 점검해 주세요.
+
+# 규칙:
+• 확고한 목적(금액·기한)은 바꾸지 말고, 막힌 부분은 계획을 고쳐서 대응하세요
+• 실제로 한 행동과 결과만 보세요. 의욕이나 다짐은 점수에 넣지 마세요
+• 다음 주 첫 행동은 하나만, 구체적으로
+• 투자 종목의 매수·매도는 다루지 마세요
+
+# 맥락:
+• 확고한 목적: {goal.get('purpose') or '-'}
+• 아침저녁 문장: {goal.get('statement') or '-'}
+• 3단계 계획:
+{plan_result or '(3단계 미확정)'}
+• 이번 주 첫 행동: {goal.get('first_action') or '-'}
+• 매일의 습관: {goal.get('habit') or '-'} (이번 주 완료 {habit_days}일)
+• 이번 주에 한 것: {done or '-'}
+• 막힌 것: {blocked or '-'}
+• 내가 생각한 다음 주 첫 행동: {nxt or '(비어 있음)'}
+
+# 출력 형식:
+• 이번 주 판정: [계획대로 / 일부 진행 / 멈춤 중 하나와 한 줄 이유]
+• 막힌 원인: [행동 기준으로 한 줄]
+• 고친 계획: [바꾼 부분만]
+• 다음 주 첫 행동: [하나, 구체적으로]"""

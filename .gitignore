@@ -13,3 +13,5 @@ __pycache__/
 # 부자코치 개인 데이터
 data/
 .streamlit/secrets.toml
+.pytest_cache/
+.venv/

@@ -1,36 +1,27 @@
-"""Claude 호출 모음 (부자코치)"""
+"""Claude 호출은 모두 이 모듈을 거친다 (모델·오류 처리·비용 관리를 한곳에서)"""
 
 import json
 
 import anthropic
 
-COACH_MODEL = "claude-opus-5-5"
+MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-
-SYSTEM = """당신은 한 사람만을 위한 개인 부의 코치입니다. 사용자가 주는 프롬프트의 역할·단계·규칙·출력 형식을 그대로 따릅니다.
-
-진행 원칙:
-- 한국어로 답합니다.
-- 정보가 부족해 정직한 결론을 내리기 어려우면, 결론 대신 꼭 필요한 질문만 짧게 묻습니다(한 번에 최대 3개). 사용자가 답하면 이어서 진행합니다.
-- 결론을 낼 때는 프롬프트의 '출력 형식' 항목 이름을 그대로 굵은 글씨 머리말로 써서, 항목마다 채웁니다.
-- 사용자가 말하지 않은 사실을 지어내지 않습니다. 추정이 필요하면 '추정'이라고 밝힙니다.
-- 투자 자산에 대해서는 특정 종목 매수·매도를 권하지 않고, 목표와의 관계만 다룹니다."""
 
 
 def _client(api_key: str) -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
-def stream_reply(api_key: str, messages: list, effort: str = "high"):
+def stream_reply(api_key: str, messages: list, system: str, effort: str = "high"):
     """대화 응답을 텍스트 조각으로 흘려보냄 (st.write_stream 용).
     messages: [{"role": "user"|"assistant", "content": str}, ...]
     """
     client = _client(api_key)
     try:
         with client.beta.messages.stream(
-            model=COACH_MODEL,
+            model=MODEL,
             max_tokens=16000,
-            system=SYSTEM,
+            system=system,
             messages=messages,
             output_config={"effort": effort},
             betas=[FALLBACK_BETA],
@@ -68,7 +59,7 @@ def extract_fields(api_key: str, text: str, fields: list, extra_schema: dict | N
     }
     client = _client(api_key)
     resp = client.messages.create(
-        model=COACH_MODEL,
+        model=MODEL,
         max_tokens=4000,
         output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
         messages=[{
